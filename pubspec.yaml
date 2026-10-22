@@ -1,0 +1,34 @@
+name: nexa_browser
+description: "NexaBrowser — navigateur mobile léger : bloqueur de pubs, économie de données, détection et téléchargement de vidéos."
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.5.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # Moteur web : WebView Chromium (Android) / WKWebView (iOS)
+  flutter_inappwebview: ^6.1.5
+  # Historique, favoris, téléchargements
+  sqflite: ^2.4.1
+  path: ^1.9.0
+  path_provider: ^2.1.5
+  # Réglages
+  shared_preferences: ^2.3.3
+  # Téléchargements
+  http: ^1.2.2
+  open_filex: ^4.6.0
+  # Liens vers d'autres apps (WhatsApp, téléphone, e-mail…)
+  url_launcher: ^6.3.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/adblock/
