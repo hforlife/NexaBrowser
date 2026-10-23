@@ -61,8 +61,8 @@ class _StartPageState extends State<StartPage> {
           if (widget.isPrivate) ...[
             const SizedBox(height: 8),
             Text(
-              "Votre historique, vos cookies et les données des sites ne seront pas enregistrés "
-              "après la fermeture de l'onglet.",
+              "Les pages visitées ne sont pas ajoutées à l'historique et ne sont pas mises en cache.\n"
+              "Les cookies et connexions aux sites restent partagés avec vos autres onglets.",
               textAlign: TextAlign.center,
               style: text.bodyMedium?.copyWith(color: scheme.onInverseSurface),
             ),

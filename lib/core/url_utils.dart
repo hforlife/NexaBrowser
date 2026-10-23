@@ -39,6 +39,24 @@ class UrlUtils {
   static bool hostMatches(String host, String domain) =>
       host == domain || host.endsWith('.$domain');
 
+  /// Vrai si les deux URL appartiennent au même site (deux derniers niveaux
+  /// du nom : « video.site.ml » et « www.site.ml » → « site.ml »).
+  ///
+  /// Approximation volontaire (pas de liste des suffixes publics) : sert
+  /// seulement à décider si les cookies du site accompagnent un téléchargement.
+  static bool isSameSite(String urlA, String urlB) {
+    final String a = siteOf(urlA);
+    return a.isNotEmpty && a == siteOf(urlB);
+  }
+
+  /// Site d'une URL : « https://m.site.ml/page » → « site.ml » (chaîne vide si invalide).
+  static String siteOf(String url) => _siteOfHost(hostOf(url));
+
+  static String _siteOfHost(String host) {
+    final List<String> labels = host.split('.');
+    return labels.length <= 2 ? host : labels.sublist(labels.length - 2).join('.');
+  }
+
   /// Texte affiché dans la barre d'adresse quand elle n'a pas le focus.
   static String displayUrl(String url) {
     final Uri? uri = Uri.tryParse(url);

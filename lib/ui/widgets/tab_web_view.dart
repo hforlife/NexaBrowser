@@ -1,7 +1,7 @@
 import 'dart:collection';
 import 'dart:io';
-import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -10,11 +10,12 @@ import '../../app_scope.dart';
 import '../../core/constants.dart';
 import '../../core/theme.dart';
 import '../../models/detected_media.dart';
-import '../../services/adblock_service.dart';
+import '../../services/adblock/adblock_service.dart';
 import '../../services/media_detector.dart';
 import '../../services/settings_service.dart';
 import '../../state/browser_controller.dart';
 import '../../state/browser_tab.dart';
+import '../../state/page_load_stats.dart';
 import 'start_page.dart';
 
 /// Demande de téléchargement venant d'une page (lien de fichier).
@@ -45,10 +46,17 @@ class _TabWebViewState extends State<TabWebView> {
   /// Schémas affichés dans la WebView ; les autres sont confiés au système.
   static const Set<String> _webSchemes = {'http', 'https', 'about', 'data', 'javascript', 'blob'};
 
+  /// Schéma interdit en navigation principale lancée par une page (hameçonnage).
+  static const String _dataScheme = 'data';
+
+  /// Mesures de chargement (debug et profile uniquement, jamais en release).
+  static const bool _measure = !kReleaseMode;
+
   late final SettingsService _settings;
   late final AdblockService _adblock;
   late final BrowserController _browser;
   PullToRefreshController? _pullToRefresh;
+  final PageLoadStats _stats = PageLoadStats();
 
   bool _showStartPage = true;
   bool _lastAdblock = true;
@@ -56,6 +64,11 @@ class _TabWebViewState extends State<TabWebView> {
   bool _initialized = false;
 
   BrowserTab get _tab => widget.tab;
+
+  /// Android : chaque requête passe par Dart (blocage + détection vidéo).
+  /// Coûteux : l'appel est synchrone côté natif, d'où les mesures [_stats].
+  bool get _interceptionEnabled =>
+      Platform.isAndroid && (_settings.adblockEnabled || _settings.mediaDetection);
 
   @override
   void didChangeDependencies() {
@@ -118,17 +131,17 @@ class _TabWebViewState extends State<TabWebView> {
     final bool adblock = _settings.adblockEnabled;
     return InAppWebViewSettings(
       javaScriptEnabled: true,
-      // Android : chaque requête passe par Dart → blocage + détection vidéo
-      useShouldInterceptRequest: Platform.isAndroid && (adblock || _settings.mediaDetection),
+      useShouldInterceptRequest: _interceptionEnabled,
       useOnLoadResource: _settings.mediaDetection,
       useOnDownloadStart: true,
       useShouldOverrideUrlLoading: true,
-      // Navigation privée : rien n'est conservé
-      incognito: _tab.isPrivate,
+      // Navigation privée : pas de cache. On n'utilise PAS « incognito » :
+      // sur Android il efface les cookies de TOUS les onglets (stockage unique).
       cacheEnabled: !_tab.isPrivate,
-      // Économie de données : pas d'images, pas de lecture auto des vidéos
+      // Économie de données : pas d'images
       blockNetworkImage: _settings.dataSaver,
-      mediaPlaybackRequiresUserGesture: _settings.dataSaver,
+      // Pas de lecture automatique par défaut (données mobiles chères)
+      mediaPlaybackRequiresUserGesture: !_settings.allowsAutoplay,
       allowsInlineMediaPlayback: true,
       // Version ordinateur
       preferredContentMode: _settings.desktopMode
@@ -179,14 +192,19 @@ class _TabWebViewState extends State<TabWebView> {
       },
       onLoadStart: (InAppWebViewController controller, WebUri? url) {
         if (url != null) _tab.onPageStarted(url.toString());
+        if (_measure) _stats.start();
       },
       onLoadStop: (InAppWebViewController controller, WebUri? url) async {
         _pullToRefresh?.endRefreshing();
         _tab.onPageFinished(url?.toString() ?? _tab.url);
-        await _refreshNavigation(controller);
-        if (_settings.adblockEnabled) {
-          await controller.injectCSSCode(source: cosmeticAdblockCss);
+        if (_measure) {
+          final String? summary =
+              _stats.finish(url: _tab.url, interception: _interceptionEnabled);
+          if (summary != null) debugPrint(summary);
         }
+        await _refreshNavigation(controller);
+        final String? cosmeticCss = _settings.adblockEnabled ? _adblock.cosmeticCssFor(_tab.site) : null;
+        if (cosmeticCss != null) await controller.injectCSSCode(source: cosmeticCss);
         await _browser.recordVisit(_tab);
       },
       onReceivedError: (InAppWebViewController controller, WebResourceRequest request,
@@ -204,16 +222,11 @@ class _TabWebViewState extends State<TabWebView> {
         _refreshNavigation(controller);
       },
       shouldInterceptRequest: (InAppWebViewController controller, WebResourceRequest request) async {
-        final String url = request.url.toString();
-        if (_settings.mediaDetection) _onNetworkMedia(url);
-
-        final bool isMainFrame = request.isForMainFrame ?? false;
-        if (_settings.adblockEnabled && !isMainFrame && _adblock.isBlockedUrl(url)) {
-          _tab.incrementBlocked();
-          // Réponse vide : la publicité n'est jamais téléchargée
-          return WebResourceResponse(contentType: 'text/plain', data: Uint8List(0));
-        }
-        return null; // requête normale
+        if (!_measure) return _interceptRequest(request);
+        final Stopwatch watch = Stopwatch()..start();
+        final WebResourceResponse? response = _interceptRequest(request);
+        _stats.recordRequest(watch.elapsedMicroseconds, blocked: response != null);
+        return response;
       },
       onLoadResource: (InAppWebViewController controller, LoadedResource resource) {
         final WebUri? url = resource.url;
@@ -231,13 +244,33 @@ class _TabWebViewState extends State<TabWebView> {
       shouldOverrideUrlLoading:
           (InAppWebViewController controller, NavigationAction action) async {
         final WebUri? uri = action.request.url;
-        if (uri == null || _webSchemes.contains(uri.scheme)) {
-          return NavigationActionPolicy.ALLOW;
+        if (uri == null) return NavigationActionPolicy.ALLOW;
+        // Une page ne peut pas ouvrir une URL « data: » en pleine page (hameçonnage)
+        if (uri.scheme == _dataScheme && action.isForMainFrame) {
+          return NavigationActionPolicy.CANCEL;
         }
+        if (_webSchemes.contains(uri.scheme)) return NavigationActionPolicy.ALLOW;
         await _openExternal(uri, controller);
         return NavigationActionPolicy.CANCEL;
       },
     );
+  }
+
+  /// Décision pour une requête : réponse vide si bloquée, null sinon.
+  /// Exécutée pour CHAQUE ressource : doit rester très rapide.
+  WebResourceResponse? _interceptRequest(WebResourceRequest request) {
+    final String url = request.url.toString();
+    if (_settings.mediaDetection) _onNetworkMedia(url);
+
+    final bool isMainFrame = request.isForMainFrame ?? false;
+    // La page elle-même n'est jamais bloquée ; les exceptions par site sont
+    // appliquées par le service
+    if (_settings.adblockEnabled && !isMainFrame && _adblock.shouldBlock(request.url, pageSite: _tab.site)) {
+      _tab.incrementBlocked();
+      // Réponse vide : la publicité n'est jamais téléchargée
+      return WebResourceResponse(contentType: 'text/plain', data: Uint8List(0));
+    }
+    return null; // requête normale
   }
 
   Future<void> _refreshNavigation(InAppWebViewController controller) async {
@@ -255,17 +288,11 @@ class _TabWebViewState extends State<TabWebView> {
     _addMedia(url, kind, MediaSource.network);
   }
 
-  /// Résultats du script JS : [{url, tag, type}, …]
+  /// Résultats du script JS, validés par [MediaDetector.parsePageReport].
   void _onPageMedia(List<dynamic> args) {
-    if (!_settings.mediaDetection || args.isEmpty || args.first is! List) return;
-    for (final dynamic item in args.first as List) {
-      if (item is! Map) continue;
-      final String? url = item['url'] as String?;
-      if (url == null) continue;
-      final String type = (item['type'] as String?) ?? '';
-      final MediaKind kind = MediaDetector.classify(url, mimeType: type) ??
-          (item['tag'] == 'audio' ? MediaKind.audio : MediaKind.video);
-      _addMedia(url, kind, MediaSource.page);
+    if (!_settings.mediaDetection) return;
+    for (final PageMediaReport report in MediaDetector.parsePageReport(args)) {
+      _addMedia(report.url, report.kind, MediaSource.page);
     }
   }
 
@@ -294,13 +321,16 @@ class _TabWebViewState extends State<TabWebView> {
       }
       return;
     }
+    bool opened;
     try {
-      await launchUrl(Uri.parse(uri.toString()), mode: LaunchMode.externalApplication);
+      // launchUrl renvoie faux (sans exception) quand aucune app ne gère le lien
+      opened = await launchUrl(Uri.parse(uri.toString()), mode: LaunchMode.externalApplication);
     } catch (_) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Aucune application ne peut ouvrir ce lien.')),
-      );
+      opened = false;
     }
+    if (opened || !mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Aucune application ne peut ouvrir ce lien.')),
+    );
   }
 }

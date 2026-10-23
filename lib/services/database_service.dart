@@ -2,23 +2,27 @@ import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 
 import '../core/constants.dart';
-import '../models/download_task.dart';
 import '../models/site_entry.dart';
 
-/// Base SQLite locale : historique, favoris, téléchargements.
+/// Base SQLite locale : historique et favoris.
+///
+/// Les téléchargements sont enregistrés côté Android par le moteur natif
+/// (ils doivent rester à jour quand l'interface est fermée).
 class DatabaseService {
   static const String _fileName = 'nexa_browser.db';
-  static const int _version = 1;
+
+  /// v2 : la table des téléchargements passe côté natif.
+  static const int _version = 2;
 
   static const String tableHistory = 'history';
   static const String tableBookmarks = 'bookmarks';
-  static const String tableDownloads = 'downloads';
+  static const String _legacyTableDownloads = 'downloads';
 
   late final Database _db;
 
   Future<void> open() async {
     final String path = p.join(await getDatabasesPath(), _fileName);
-    _db = await openDatabase(path, version: _version, onCreate: _onCreate);
+    _db = await openDatabase(path, version: _version, onCreate: _onCreate, onUpgrade: _onUpgrade);
   }
 
   Future<void> _onCreate(Database db, int version) async {
@@ -37,22 +41,15 @@ class DatabaseService {
           url   TEXT NOT NULL UNIQUE,
           title TEXT NOT NULL DEFAULT '',
           date  INTEGER NOT NULL
-        )''')
-      ..execute('''
-        CREATE TABLE $tableDownloads (
-          id         TEXT PRIMARY KEY,
-          url        TEXT NOT NULL,
-          file_name  TEXT NOT NULL,
-          save_path  TEXT NOT NULL,
-          created_at INTEGER NOT NULL,
-          referer    TEXT,
-          is_hls     INTEGER NOT NULL DEFAULT 0,
-          received   INTEGER NOT NULL DEFAULT 0,
-          total      INTEGER,
-          status     TEXT NOT NULL,
-          error      TEXT
         )''');
     await batch.commit(noResult: true);
+  }
+
+  Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
+    if (oldVersion < 2) {
+      // v0.1 n'a jamais été publiée : l'ancienne file Dart est simplement supprimée
+      await db.execute('DROP TABLE IF EXISTS $_legacyTableDownloads');
+    }
   }
 
   // ------------------------------------------------------------ historique
@@ -120,21 +117,4 @@ class DatabaseService {
 
   Future<void> removeBookmark(String url) =>
       _db.delete(tableBookmarks, where: 'url = ?', whereArgs: [url]);
-
-  // -------------------------------------------------------- téléchargements
-
-  Future<List<DownloadTask>> downloads() async {
-    final List<Map<String, Object?>> rows =
-        await _db.query(tableDownloads, orderBy: 'created_at DESC');
-    return rows.map(DownloadTask.fromMap).toList();
-  }
-
-  Future<void> saveDownload(DownloadTask task) => _db.insert(
-        tableDownloads,
-        task.toMap(),
-        conflictAlgorithm: ConflictAlgorithm.replace,
-      );
-
-  Future<void> deleteDownload(String id) =>
-      _db.delete(tableDownloads, where: 'id = ?', whereArgs: [id]);
 }

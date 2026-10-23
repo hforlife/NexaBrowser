@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Dossiers partagés via FileProvider (Android 9 et moins) -->
+<paths>
+    <!-- Dossier public : Téléchargements/NexaBrowser -->
+    <external-path name="downloads_public" path="Download/" />
+    <!-- Repli sans permission : dossier propre à l'app -->
+    <external-files-path name="downloads_private" path="." />
+    <files-path name="downloads_internal" path="." />
+</paths>

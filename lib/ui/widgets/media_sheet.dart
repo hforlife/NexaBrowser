@@ -4,6 +4,7 @@ import '../../app_scope.dart';
 import '../../core/formatters.dart';
 import '../../core/url_utils.dart';
 import '../../models/detected_media.dart';
+import '../../services/download_service.dart';
 import '../../state/browser_tab.dart';
 import '../screens/downloads_screen.dart';
 
@@ -80,12 +81,21 @@ class _MediaTile extends StatelessWidget {
     final AppScope scope = AppScope.of(context);
     final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
     final NavigatorState navigator = Navigator.of(context);
-    await scope.downloads.enqueue(
-      url: media.url,
-      fileName: _fileName,
-      referer: media.pageUrl,
-      isHls: media.isHls,
-    );
+    try {
+      await scope.downloads.enqueue(
+        url: media.url,
+        fileName: _fileName,
+        referer: media.pageUrl,
+        mimeType: media.mimeType,
+        isHls: media.isHls,
+        // Cookies du site seulement si le média est sur le même site que la page
+        withCookies: UrlUtils.isSameSite(media.url, media.pageUrl),
+      );
+    } on DownloadException catch (e) {
+      navigator.pop();
+      messenger.showSnackBar(SnackBar(content: Text(e.message)));
+      return;
+    }
     navigator.pop();
     messenger.showSnackBar(SnackBar(
       content: const Text('Téléchargement lancé'),

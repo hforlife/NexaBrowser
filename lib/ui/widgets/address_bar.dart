@@ -1,7 +1,11 @@
 import 'package:flutter/material.dart';
 
+import '../../app_scope.dart';
 import '../../core/url_utils.dart';
+import '../../services/adblock/adblock_service.dart';
+import '../../services/settings_service.dart';
 import '../../state/browser_tab.dart';
+import 'adblock_sheet.dart';
 
 /// Barre d'adresse : affiche le site, permet de taper une adresse ou une recherche.
 class AddressBar extends StatefulWidget {
@@ -121,7 +125,7 @@ class _AddressBarState extends State<AddressBar> {
             ),
           ),
           if (!_focus.hasFocus && !tab.isStartPage) ...[
-            if (tab.blockedCount > 0) _BlockedBadge(count: tab.blockedCount),
+            _ShieldButton(tab: tab),
             IconButton(
               tooltip: tab.isLoading ? 'Arrêter' : 'Actualiser',
               icon: Icon(tab.isLoading ? Icons.close : Icons.refresh),
@@ -134,37 +138,51 @@ class _AddressBarState extends State<AddressBar> {
   }
 }
 
-/// Bouclier indiquant le nombre de publicités bloquées sur la page.
-class _BlockedBadge extends StatelessWidget {
-  const _BlockedBadge({required this.count});
+/// Bouclier : nombre de publicités bloquées sur la page ; barré si le site
+/// est autorisé. Toucher ouvre [AdblockSheet].
+class _ShieldButton extends StatelessWidget {
+  const _ShieldButton({required this.tab});
 
-  final int count;
+  final BrowserTab tab;
 
   @override
   Widget build(BuildContext context) {
+    final AppScope scope = AppScope.of(context);
+    final SettingsService settings = scope.settings;
+    final AdblockService adblock = scope.adblock;
     final ColorScheme scheme = Theme.of(context).colorScheme;
-    return Tooltip(
-      message: '$count publicités et traqueurs bloqués',
-      child: InkWell(
-        borderRadius: BorderRadius.circular(12),
-        onTap: () => ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('🛡️ $count publicités et traqueurs bloqués sur cette page')),
-        ),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(Icons.shield_outlined, size: 18, color: scheme.primary),
-              const SizedBox(width: 2),
-              Text(
-                count > 99 ? '99+' : '$count',
-                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: scheme.primary),
+
+    return ListenableBuilder(
+      listenable: Listenable.merge([settings, adblock.exceptions]),
+      builder: (BuildContext context, _) {
+        if (!settings.adblockEnabled || tab.site.isEmpty) return const SizedBox.shrink();
+        final bool active = adblock.isActiveOn(tab.site);
+        final int count = tab.blockedCount;
+        final Color color = active ? scheme.primary : scheme.outline;
+        return Tooltip(
+          message: active ? '$count publicités et traqueurs bloqués' : 'Bloqueur désactivé sur ce site',
+          child: InkWell(
+            borderRadius: BorderRadius.circular(12),
+            onTap: () => AdblockSheet.show(context, tab),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(active ? Icons.shield_outlined : Icons.remove_moderator_outlined, size: 18, color: color),
+                  if (active && count > 0) ...[
+                    const SizedBox(width: 2),
+                    Text(
+                      count > 99 ? '99+' : '$count',
+                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: color),
+                    ),
+                  ],
+                ],
               ),
-            ],
+            ),
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 }

@@ -1,6 +1,6 @@
 import 'package:flutter/widgets.dart';
 
-import 'services/adblock_service.dart';
+import 'services/adblock/adblock_service.dart';
 import 'services/database_service.dart';
 import 'services/download_service.dart';
 import 'services/settings_service.dart';

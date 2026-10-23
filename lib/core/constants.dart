@@ -9,6 +9,9 @@ class AppConstants {
   /// Nombre maximum d'onglets ouverts (chaque WebView consomme de la mémoire).
   static const int maxTabs = 12;
 
+  /// Nombre maximum de médias retenus par page (protège la mémoire).
+  static const int maxMediaPerPage = 50;
+
   /// Nombre maximum d'entrées d'historique conservées.
   static const int maxHistoryEntries = 2000;
 
@@ -21,9 +24,6 @@ class AppConstants {
 
   /// Nom du gestionnaire JS appelé par le script de détection vidéo.
   static const String mediaJsHandler = 'nexaMedia';
-
-  /// Sous-dossier des téléchargements.
-  static const String downloadsFolder = 'NexaBrowser';
 }
 
 /// Moteurs de recherche disponibles.

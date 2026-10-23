@@ -2,6 +2,14 @@ import '../core/constants.dart';
 import '../core/url_utils.dart';
 import '../models/detected_media.dart';
 
+/// Média signalé par le script injecté, après validation.
+class PageMediaReport {
+  const PageMediaReport({required this.url, required this.kind});
+
+  final String url;
+  final MediaKind kind;
+}
+
 /// Reconnaît les URL de médias téléchargeables.
 ///
 /// Deux sources alimentent la détection :
@@ -17,10 +25,17 @@ class MediaDetector {
   /// Morceaux de flux (segments) : jamais proposés seuls.
   static const Set<String> _segmentExtensions = {'.ts', '.m4s', '.aac.ts', '.vtt'};
 
+  /// Nombre max d'éléments acceptés par message du script (une page hostile
+  /// pourrait envoyer des milliers d'entrées).
+  static const int maxItemsPerReport = 20;
+
+  /// Longueur max d'une URL signalée par une page.
+  static const int maxUrlLength = 2048;
+
   /// Classe une URL : type de média, ou null si ce n'en est pas un.
   static MediaKind? classify(String url, {String? mimeType}) {
     final Uri? uri = Uri.tryParse(url);
-    if (uri == null || !(uri.isScheme('http') || uri.isScheme('https'))) return null;
+    if (uri == null || !_isHttp(uri)) return null;
 
     final String mime = (mimeType ?? '').toLowerCase();
     if (mime.contains('mpegurl')) return MediaKind.stream;
@@ -47,19 +62,52 @@ class MediaDetector {
       (String d) => UrlUtils.hostMatches(mediaHost, d) || UrlUtils.hostMatches(pageHost, d),
     );
   }
+
+  /// Valide les arguments reçus du script injecté : `[[{url, tag, type}, …]]`.
+  ///
+  /// N'importe quelle page (ou iframe publicitaire) peut appeler le gestionnaire :
+  /// seules les URL http(s) bien formées sont gardées, en nombre limité.
+  static List<PageMediaReport> parsePageReport(List<dynamic> args) {
+    if (args.isEmpty || args.first is! List) return const [];
+    final List<PageMediaReport> reports = [];
+    for (final dynamic item in (args.first as List).take(maxItemsPerReport)) {
+      if (item is! Map) continue;
+      final Object? rawUrl = item['url'];
+      if (rawUrl is! String || rawUrl.length > maxUrlLength) continue;
+      final Uri? uri = Uri.tryParse(rawUrl);
+      if (uri == null || !_isHttp(uri) || uri.host.isEmpty) continue;
+
+      final Object? rawType = item['type'];
+      final String type = rawType is String ? rawType : '';
+      final MediaKind kind = classify(rawUrl, mimeType: type) ??
+          (item['tag'] == 'audio' ? MediaKind.audio : MediaKind.video);
+      reports.add(PageMediaReport(url: rawUrl, kind: kind));
+    }
+    return reports;
+  }
+
+  static bool _isHttp(Uri uri) => uri.isScheme('http') || uri.isScheme('https');
 }
 
 /// Script injecté dans chaque page : signale les sources des balises
 /// <video>/<audio> au code Dart, y compris celles ajoutées après coup.
 /// Les sources « blob: » (lecteurs MSE) ne sont pas téléchargeables directement :
 /// elles sont ignorées, le flux réel est capté côté réseau (.m3u8).
+///
+/// Sur les sites très dynamiques (Facebook…), le DOM change sans arrêt :
+/// l'analyse est donc regroupée au plus une fois toutes les 800 ms.
 const String mediaDetectionScript = '''
 (function () {
   if (window.__nexaMediaInstalled) return;
   window.__nexaMediaInstalled = true;
   var reported = {};
+  var reportedCount = 0;
+  var MAX_REPORTED = 100;
+  var DELAY_MS = 800;
+  var timer = null;
 
   function collect() {
+    if (reportedCount >= MAX_REPORTED) return;
     var found = [];
     var nodes = document.querySelectorAll('video, audio, video source, audio source');
     for (var i = 0; i < nodes.length; i++) {
@@ -69,6 +117,7 @@ const String mediaDetectionScript = '''
       try { src = new URL(src, document.baseURI).href; } catch (e) { continue; }
       if (reported[src]) continue;
       reported[src] = true;
+      reportedCount++;
       var tag = (el.tagName === 'SOURCE' && el.parentElement) ? el.parentElement.tagName : el.tagName;
       found.push({ url: src, tag: tag.toLowerCase(), type: el.getAttribute('type') || '' });
     }
@@ -77,9 +126,15 @@ const String mediaDetectionScript = '''
     }
   }
 
+  // Regroupe les appels : une seule analyse par période, quel que soit le nombre de mutations
+  function schedule() {
+    if (timer !== null) return;
+    timer = setTimeout(function () { timer = null; collect(); }, DELAY_MS);
+  }
+
   collect();
-  new MutationObserver(function () { collect(); })
+  new MutationObserver(schedule)
     .observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
-  document.addEventListener('play', function () { collect(); }, true);
+  document.addEventListener('play', schedule, true);
 })();
 ''';

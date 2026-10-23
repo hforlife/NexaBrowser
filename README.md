@@ -11,7 +11,7 @@ Navigateur mobile léger (Flutter) pensé pour l'Afrique : **bloqueur de publici
 | 🛡 Bloqueur de pubs | blocage réseau par domaine (Android) + masquage des emplacements vides ; liste de base intégrée, liste complète (~150 000 domaines) téléchargeable dans Paramètres ; compteur de pubs bloquées par page |
 | 📉 Économie de données | images non chargées, vidéos sans lecture automatique |
 | 🎬 Détection vidéo | MP4/WEBM/MP3… et flux HLS (.m3u8), via le réseau et les balises `<video>` (y compris dans les iframes) ; bouton flottant avec compteur |
-| ⬇️ Téléchargements | 2 simultanés, pause/reprise (HTTP Range), cookies et Referer du site transmis, assemblage HLS en `.ts` |
+| ⬇️ Téléchargements | moteur natif Android : continue app fermée (service au premier plan), notifications avec Pause / Reprendre / Annuler, 2 simultanés, reprise HTTP Range, nouvel essai automatique et reprise au retour du réseau, HLS (TS, fMP4, audio séparé) converti en `.mp4` sans réencodage |
 | ⭐ Favoris, 🕘 Historique | SQLite, recherche dans l'historique |
 | 🖥 Version ordinateur | bascule à la volée |
 | 🔗 Liens externes | WhatsApp, téléphone, e-mail, `intent://` (repli sur la version web) |
@@ -35,7 +35,21 @@ APK de test : `flutter build apk --release` → `build/app/outputs/flutter-apk/a
 
 ## Où vont les fichiers téléchargés ?
 
-Android : `Android/data/com.nexa.nexa_browser/files/Download/NexaBrowser/` (aucune permission de stockage nécessaire).
+Android 10 et plus : dossier public **Téléchargements/NexaBrowser** (MediaStore, aucune permission).
+Android 9 et moins : même dossier si la permission de stockage est accordée, sinon
+`Android/data/com.nexa.nexa_browser/files/Download/NexaBrowser/`.
+
+Le moteur est en Kotlin (`android/app/src/main/kotlin/com/nexa/nexa_browser/download/`) ;
+Dart (`lib/services/download_service.dart`) ne fait que l'afficher et le piloter.
+
+Tests du moteur :
+
+```bash
+cd android && ./gradlew :app:testDebugUnitTest      # tests JVM (HLS, reprise, erreurs)
+flutter test integration_test/downloads_test.dart \
+  --dart-define=NEXA_TEST_SERVER=http://10.0.2.2:8765 \
+  --dart-define=NEXA_CLIP_SIZE=… --dart-define=NEXA_BIG_SIZE=…   # sur émulateur, serveur de test requis
+```
 
 ## Structure
 

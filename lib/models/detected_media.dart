@@ -25,6 +25,13 @@ class DetectedMedia {
     this.contentLength,
   });
 
+  /// Extensions reprises telles quelles depuis l'URL ; les autres (« .php »,
+  /// « .aspx »…) sont remplacées par l'extension par défaut du type de média.
+  static const Set<String> _knownExtensions = {
+    '.mp4', '.webm', '.mov', '.mkv', '.m4v', '.3gp',
+    '.mp3', '.m4a', '.aac', '.ogg', '.wav', '.opus',
+  };
+
   final String url;
   final MediaKind kind;
   final MediaSource source;
@@ -35,12 +42,15 @@ class DetectedMedia {
 
   bool get isHls => kind == MediaKind.stream;
 
-  /// Extension de fichier probable.
+  /// Extension du fichier final. Les flux HLS sont convertis en MP4 par le moteur.
   String get extension {
-    if (isHls) return '.ts';
+    if (isHls) return '.mp4';
     final String path = (Uri.tryParse(url)?.path ?? '').toLowerCase();
     final int dot = path.lastIndexOf('.');
-    if (dot != -1 && path.length - dot <= 5) return path.substring(dot);
+    if (dot != -1) {
+      final String fromUrl = path.substring(dot);
+      if (_knownExtensions.contains(fromUrl)) return fromUrl;
+    }
     return kind == MediaKind.audio ? '.mp3' : '.mp4';
   }
 }

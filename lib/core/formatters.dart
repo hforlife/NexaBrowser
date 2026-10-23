@@ -27,7 +27,23 @@ class Formatters {
     if (diff.inHours < 1) return 'il y a ${diff.inMinutes} min';
     if (diff.inDays < 1) return 'il y a ${diff.inHours} h';
     if (diff.inDays == 1) return 'hier';
+    return Formatters.date(date);
+  }
+
+  /// « 12/10/2026 »
+  static String date(DateTime value) {
     String two(int n) => n.toString().padLeft(2, '0');
-    return '${two(date.day)}/${two(date.month)}/${date.year}';
+    return '${two(value.day)}/${two(value.month)}/${value.year}';
+  }
+
+  /// 1 234 567 → « 1 234 567 » (espace insécable fine entre les milliers).
+  static String count(int value) {
+    final String digits = value.abs().toString();
+    final StringBuffer buffer = StringBuffer(value < 0 ? '-' : '');
+    for (int i = 0; i < digits.length; i++) {
+      if (i > 0 && (digits.length - i) % 3 == 0) buffer.write(' ');
+      buffer.write(digits[i]);
+    }
+    return buffer.toString();
   }
 }

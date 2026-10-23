@@ -68,6 +68,7 @@ class BrowserScreen extends StatelessWidget {
                               url: url,
                               referer: referer,
                               suggestedName: suggestedName,
+                              mimeType: mimeType,
                               contentLength: contentLength,
                             ),
                           ),
@@ -91,9 +92,12 @@ class BrowserScreen extends StatelessWidget {
     required String url,
     required String referer,
     String? suggestedName,
+    String? mimeType,
     int? contentLength,
   }) async {
     final DownloadService downloads = AppScope.of(context).downloads;
+    final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
+    final NavigatorState navigator = Navigator.of(context);
     final String name = UrlUtils.sanitizeFileName(
       (suggestedName != null && suggestedName.isNotEmpty)
           ? suggestedName
@@ -116,13 +120,18 @@ class BrowserScreen extends StatelessWidget {
       ),
     );
     if (ok != true) return;
-    await downloads.enqueue(url: url, fileName: name, referer: referer);
-    if (!context.mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+    try {
+      // Lien touché dans la page : la WebView aurait envoyé les cookies du site
+      await downloads.enqueue(url: url, fileName: name, referer: referer, mimeType: mimeType);
+    } on DownloadException catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text(e.message)));
+      return;
+    }
+    messenger.showSnackBar(SnackBar(
       content: Text('Téléchargement de « $name »'),
       action: SnackBarAction(
         label: 'Voir',
-        onPressed: () => Navigator.of(context).push(
+        onPressed: () => navigator.push(
           MaterialPageRoute<void>(builder: (_) => const DownloadsScreen()),
         ),
       ),

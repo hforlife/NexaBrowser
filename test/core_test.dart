@@ -1,12 +1,18 @@
-// Tests des briques sans interface (URL, bloqueur, détection vidéo, HLS) : « flutter test ».
+// Tests des briques sans interface (URL, bloqueur, détection vidéo, téléchargements) : « flutter test ».
+// Le moteur de téléchargement natif (HLS, reprise…) est testé côté Kotlin :
+// cd android && ./gradlew :app:testDebugUnitTest
+import 'dart:isolate';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:nexa_browser/core/constants.dart';
 import 'package:nexa_browser/core/formatters.dart';
 import 'package:nexa_browser/core/url_utils.dart';
 import 'package:nexa_browser/models/detected_media.dart';
-import 'package:nexa_browser/services/adblock_service.dart';
-import 'package:nexa_browser/services/hls_parser.dart';
+import 'package:nexa_browser/models/download_task.dart';
+import 'package:nexa_browser/services/adblock/adblock_engine.dart';
+import 'package:nexa_browser/services/adblock/domain_set_engine.dart';
 import 'package:nexa_browser/services/media_detector.dart';
+import 'package:nexa_browser/state/page_load_stats.dart';
 
 void main() {
   group('UrlUtils.resolveInput', () {
@@ -42,8 +48,8 @@ void main() {
     });
   });
 
-  group('AdblockService', () {
-    final Set<String> domains = AdblockService.parseHosts('''
+  group('DomainSetEngine', () {
+    final Set<String> domains = DomainSetEngine.parseHosts('''
 # commentaire
 0.0.0.0 ads.example.com
 127.0.0.1 localhost
@@ -56,14 +62,94 @@ doubleclick.net   # inline
     });
 
     test('bloque les sous-domaines', () {
-      expect(AdblockService.isHostInSet('stats.g.doubleclick.net', domains), isTrue);
-      expect(AdblockService.isHostInSet('ads.example.com', domains), isTrue);
+      expect(DomainSetEngine.isHostInSet('stats.g.doubleclick.net', domains), isTrue);
+      expect(DomainSetEngine.isHostInSet('ads.example.com', domains), isTrue);
     });
 
     test('ne bloque pas les sites légitimes', () {
-      expect(AdblockService.isHostInSet('example.com', domains), isFalse);
-      expect(AdblockService.isHostInSet('notdoubleclick.net', domains), isFalse);
-      expect(AdblockService.isHostInSet('net', domains), isFalse);
+      expect(DomainSetEngine.isHostInSet('example.com', domains), isFalse);
+      expect(DomainSetEngine.isHostInSet('notdoubleclick.net', domains), isFalse);
+      expect(DomainSetEngine.isHostInSet('net', domains), isFalse);
+    });
+
+    test('fusion : liste embarquée en tête, sans doublon', () {
+      final Set<String> merged = DomainSetEngine.mergeDomains(
+        {'doubleclick.net', 'adnxs.com'},
+        {'tracker.io', 'doubleclick.net', 'pub.ml'},
+      );
+      expect(merged.toList(), ['doubleclick.net', 'adnxs.com', 'tracker.io', 'pub.ml']);
+    });
+
+    test('décision par requête, insensible à la casse', () {
+      final DomainSetEngine engine = DomainSetEngine(domains);
+      expect(engine.ruleCount, 2);
+      bool blocks(String url) =>
+          engine.shouldBlock(AdblockRequest(url: Uri.parse(url), pageSite: 'site.ml'));
+      expect(blocks('https://Stats.G.DoubleClick.net/pixel.gif'), isTrue);
+      expect(blocks('https://site.ml/app.js'), isFalse);
+      expect(blocks('data:image/png;base64,AAAA'), isFalse);
+      expect(DomainSetEngine.empty().ruleCount, 0);
+    });
+
+    test('analyse dans un isolate (comme au démarrage)', () async {
+      const String content = '0.0.0.0 a.com\n0.0.0.0 b.com\n';
+      final Set<String> parsed = await Isolate.run(() => DomainSetEngine.parseHosts(content));
+      expect(parsed, {'a.com', 'b.com'});
+    });
+  });
+
+  group('MediaDetector.parsePageReport', () {
+    test('garde les médias http(s) valides', () {
+      final List<PageMediaReport> reports = MediaDetector.parsePageReport([
+        [
+          {'url': 'https://cdn.ml/clip.mp4', 'tag': 'video', 'type': ''},
+          {'url': 'https://cdn.ml/son', 'tag': 'audio', 'type': ''},
+        ],
+      ]);
+      expect(reports.map((r) => r.url), ['https://cdn.ml/clip.mp4', 'https://cdn.ml/son']);
+      expect(reports.map((r) => r.kind), [MediaKind.video, MediaKind.audio]);
+    });
+
+    test('rejette les entrées invalides ou dangereuses', () {
+      final List<PageMediaReport> reports = MediaDetector.parsePageReport([
+        [
+          {'url': 'javascript:alert(1)', 'tag': 'video'},
+          {'url': 'file:///sdcard/secret.mp4', 'tag': 'video'},
+          {'url': 42, 'tag': 'video'},
+          {'url': 'https://${'a' * MediaDetector.maxUrlLength}.com/v.mp4', 'tag': 'video'},
+          'pas une map',
+        ],
+      ]);
+      expect(reports, isEmpty);
+    });
+
+    test('limite le nombre d\'entrées par message', () {
+      final List<Map<String, String>> many = [
+        for (int i = 0; i < 500; i++) {'url': 'https://cdn.ml/$i.mp4', 'tag': 'video'},
+      ];
+      expect(MediaDetector.parsePageReport([many]).length, MediaDetector.maxItemsPerReport);
+    });
+
+    test('arguments mal formés', () {
+      expect(MediaDetector.parsePageReport([]), isEmpty);
+      expect(MediaDetector.parsePageReport(['texte']), isEmpty);
+    });
+  });
+
+  group('PageLoadStats', () {
+    test('résumé après un chargement', () {
+      final PageLoadStats stats = PageLoadStats()..start();
+      stats
+        ..recordRequest(1500, blocked: true)
+        ..recordRequest(500, blocked: false);
+      final String? summary = stats.finish(url: 'https://site.ml', interception: true);
+      expect(summary, contains('requêtes interceptées : 2 (bloquées : 1)'));
+      expect(summary, contains('max : 1.50 ms'));
+      expect(stats.isRunning, isFalse);
+    });
+
+    test('rien à résumer sans démarrage', () {
+      expect(PageLoadStats().finish(url: 'x', interception: false), isNull);
     });
   });
 
@@ -99,46 +185,82 @@ doubleclick.net   # inline
     });
   });
 
-  group('HlsParser', () {
-    final Uri base = Uri.parse('https://cdn.com/live/master.m3u8');
-
-    test('liste maître : choisit la meilleure qualité', () {
-      final HlsPlaylist playlist = HlsParser.parse('''
-#EXTM3U
-#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
-low/index.m3u8
-#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720
-hd/index.m3u8
-''', base);
-      expect(playlist.isMaster, isTrue);
-      expect(playlist.bestVariant!.uri.toString(), 'https://cdn.com/live/hd/index.m3u8');
-      expect(playlist.bestVariant!.resolution, '1280x720');
+  group('UrlUtils.isSameSite', () {
+    test('même site malgré les sous-domaines', () {
+      expect(UrlUtils.isSameSite('https://video.site.ml/a.mp4', 'https://www.site.ml/page'), isTrue);
+      expect(UrlUtils.isSameSite('https://site.ml/a.mp4', 'https://site.ml/'), isTrue);
     });
 
-    test('liste média : segments résolus', () {
-      final HlsPlaylist playlist = HlsParser.parse('''
-#EXTM3U
-#EXT-X-TARGETDURATION:6
-#EXTINF:6.0,
-seg0.ts
-#EXTINF:6.0,
-https://other.com/seg1.ts
-#EXT-X-ENDLIST
-''', base);
-      expect(playlist.isMaster, isFalse);
-      expect(playlist.segments.map((u) => u.toString()),
-          ['https://cdn.com/live/seg0.ts', 'https://other.com/seg1.ts']);
-      expect(playlist.isEncrypted, isFalse);
+    test('sites différents', () {
+      expect(UrlUtils.isSameSite('https://cdn.autre.com/a.mp4', 'https://site.ml/page'), isFalse);
+      expect(UrlUtils.isSameSite('pas une url', 'https://site.ml'), isFalse);
+    });
+  });
+
+  group('DetectedMedia.extension', () {
+    DetectedMedia media(String url, MediaKind kind) =>
+        DetectedMedia(url: url, kind: kind, source: MediaSource.network, pageUrl: 'https://site.ml');
+
+    test('HLS converti en MP4', () {
+      expect(media('https://cdn.ml/master.m3u8', MediaKind.stream).extension, '.mp4');
     });
 
-    test('détecte le chiffrement', () {
-      final HlsPlaylist playlist = HlsParser.parse(
-          '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="k"\n#EXTINF:6,\na.ts\n', base);
-      expect(playlist.isEncrypted, isTrue);
+    test('extension connue reprise de l\'URL', () {
+      expect(media('https://cdn.ml/clip.webm?x=1', MediaKind.video).extension, '.webm');
+      expect(media('https://cdn.ml/son.m4a', MediaKind.audio).extension, '.m4a');
     });
 
-    test('refuse un fichier invalide', () {
-      expect(() => HlsParser.parse('<html>', base), throwsFormatException);
+    test('extension de script remplacée', () {
+      expect(media('https://site.ml/get.php?id=4', MediaKind.video).extension, '.mp4');
+      expect(media('https://site.ml/stream.aspx', MediaKind.audio).extension, '.mp3');
+    });
+  });
+
+  group('DownloadTask', () {
+    Map<Object?, Object?> row({
+      String status = 'running',
+      bool isHls = false,
+      int received = 50,
+      int? total = 200,
+      int done = 0,
+      int? segments,
+    }) =>
+        {
+          'id': 'a1',
+          'url': 'https://cdn.ml/v.mp4',
+          'fileName': 'v.mp4',
+          'isHls': isHls,
+          'createdAt': 1700000000000,
+          'status': status,
+          'receivedBytes': received,
+          'totalBytes': total,
+          'segmentsDone': done,
+          'segmentsTotal': segments,
+        };
+
+    test('lit les données du moteur natif', () {
+      final DownloadTask task = DownloadTask.fromMap(row());
+      expect(task.status, DownloadStatus.running);
+      expect(task.progress, 0.25);
+      expect(task.canPause, isTrue);
+      expect(task.canResume, isFalse);
+    });
+
+    test('progression HLS par segments', () {
+      final DownloadTask task =
+          DownloadTask.fromMap(row(isHls: true, done: 3, segments: 12, total: null));
+      expect(task.progress, 0.25);
+    });
+
+    test('statuts et actions possibles', () {
+      expect(DownloadTask.fromMap(row(status: 'converting')).canPause, isFalse);
+      expect(DownloadTask.fromMap(row(status: 'waitingNetwork')).isActive, isTrue);
+      expect(DownloadTask.fromMap(row(status: 'failed')).canResume, isTrue);
+      expect(DownloadTask.fromMap(row(status: 'inconnu')).status, DownloadStatus.failed);
+    });
+
+    test('taille inconnue', () {
+      expect(DownloadTask.fromMap(row(total: null)).progress, isNull);
     });
   });
 

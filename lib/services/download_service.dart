@@ -1,295 +1,143 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
-// Préfixe : évite le conflit entre Cookie (dart:io) et Cookie (inappwebview)
-import 'package:flutter_inappwebview/flutter_inappwebview.dart' as iaw;
-import 'package:http/http.dart' as http;
-import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
+import 'package:flutter/services.dart';
 
-import '../core/constants.dart';
-import '../core/url_utils.dart';
 import '../models/download_task.dart';
-import 'database_service.dart';
-import 'hls_parser.dart';
+import 'settings_service.dart';
 
-/// Gestionnaire de téléchargements : fichiers classiques (avec reprise)
-/// et flux HLS (.m3u8) assemblés en un seul fichier .ts.
+/// Interface Dart du moteur de téléchargement natif (Android).
+///
+/// Le moteur tourne dans un service au premier plan : il continue quand l'app
+/// est fermée, gère les notifications, les nouvelles tentatives, la conversion
+/// HLS → MP4 et l'enregistrement dans Téléchargements/NexaBrowser.
+/// Ce service se contente de refléter son état et de lui transmettre les commandes.
 class DownloadService extends ChangeNotifier {
-  DownloadService(this._db);
+  DownloadService(this._settings);
 
-  final DatabaseService _db;
-  final http.Client _client = http.Client();
+  static const MethodChannel _methods = MethodChannel('nexa_browser/downloads');
+  static const EventChannel _events = EventChannel('nexa_browser/downloads/events');
 
-  /// Téléchargements simultanés maximum.
-  static const int maxConcurrent = 2;
+  /// Clé ajoutée par le moteur aux événements de suppression.
+  static const String _removedKey = 'removed';
 
-  /// Fréquence max de rafraîchissement de l'écran et de la base pendant un transfert.
-  static const Duration _progressThrottle = Duration(milliseconds: 400);
+  final SettingsService _settings;
+  final Map<String, DownloadTask> _tasks = <String, DownloadTask>{};
+  StreamSubscription<dynamic>? _subscription;
 
-  final List<DownloadTask> _tasks = [];
-  final Set<String> _cancelled = <String>{};
-  Directory? _directory;
+  /// Téléchargements, du plus récent au plus ancien.
+  List<DownloadTask> get tasks => _tasks.values.toList()
+    ..sort((DownloadTask a, DownloadTask b) => b.createdAt.compareTo(a.createdAt));
 
-  List<DownloadTask> get tasks => List.unmodifiable(_tasks);
-  int get activeCount => _tasks.where((t) => t.status == DownloadStatus.running).length;
+  int get activeCount => _tasks.values.where((DownloadTask t) => t.isActive).length;
+
+  /// Le moteur n'existe que sur Android pour l'instant.
+  bool get isSupported => !kIsWeb && Platform.isAndroid;
 
   Future<void> load() async {
-    _tasks
-      ..clear()
-      ..addAll(await _db.downloads());
-    // Les transferts interrompus par la fermeture de l'app passent en pause
-    for (final DownloadTask task in _tasks.where((t) => t.isActive)) {
-      task.status = DownloadStatus.paused;
-      await _db.saveDownload(task);
+    if (!isSupported) return;
+    // Abonnement avant la lecture : aucun changement ne peut être manqué
+    _subscription = _events.receiveBroadcastStream().listen(_onEvent);
+    final List<Map<Object?, Object?>> rows =
+        await _methods.invokeListMethod<Map<Object?, Object?>>('list') ?? const [];
+    for (final Map<Object?, Object?> row in rows) {
+      final DownloadTask task = DownloadTask.fromMap(row);
+      _tasks.putIfAbsent(task.id, () => task);
     }
     notifyListeners();
   }
 
-  /// Dossier de destination (visible dans Android/data/<app>/files/Download/NexaBrowser).
-  Future<Directory> downloadDirectory() async {
-    if (_directory != null) return _directory!;
-    Directory? base;
-    if (Platform.isAndroid) {
-      final List<Directory>? dirs =
-          await getExternalStorageDirectories(type: StorageDirectory.downloads);
-      base = (dirs != null && dirs.isNotEmpty) ? dirs.first : null;
-    }
-    base ??= await getApplicationDocumentsDirectory();
-    final Directory dir = Directory(p.join(base.path, AppConstants.downloadsFolder));
-    await dir.create(recursive: true);
-    return _directory = dir;
-  }
-
-  /// Ajoute un téléchargement et le démarre dès qu'une place est libre.
+  /// Ajoute un téléchargement.
+  ///
+  /// [withCookies] : joindre les cookies du site (faux pour un média hébergé
+  /// sur un autre domaine que la page, signalé par un script de la page).
+  /// Lève une [DownloadException] si le moteur refuse (lien blob:, data:…).
   Future<DownloadTask> enqueue({
     required String url,
-    String? fileName,
+    required String fileName,
     String? referer,
+    String? mimeType,
     bool isHls = false,
+    bool withCookies = true,
   }) async {
-    final Directory dir = await downloadDirectory();
-    final String baseName = UrlUtils.sanitizeFileName(
-      fileName ?? UrlUtils.fileNameFromUrl(url, fallbackExtension: isHls ? '.ts' : ''),
-    );
-    final String name = isHls && !baseName.endsWith('.ts') ? '${p.withoutExtension(baseName)}.ts' : baseName;
-    final String path = await _uniquePath(dir, name);
+    if (!isSupported) {
+      throw const DownloadException('Téléchargements disponibles sur Android uniquement');
+    }
+    await _askPermissionsOnce();
+    try {
+      final Map<Object?, Object?>? row = await _methods.invokeMapMethod<Object?, Object?>('enqueue', {
+        'url': url,
+        'fileName': fileName,
+        'referer': referer,
+        'mimeType': mimeType,
+        'isHls': isHls,
+        'withCookies': withCookies,
+      });
+      if (row == null) throw const DownloadException('Téléchargement impossible');
+      final DownloadTask task = DownloadTask.fromMap(row);
+      _upsert(task);
+      return task;
+    } on PlatformException catch (e) {
+      throw DownloadException(e.message ?? 'Téléchargement impossible');
+    }
+  }
 
-    final DownloadTask task = DownloadTask(
-      id: DateTime.now().microsecondsSinceEpoch.toString(),
-      url: url,
-      fileName: p.basename(path),
-      savePath: path,
-      createdAt: DateTime.now(),
-      referer: referer,
-      isHls: isHls,
-    );
-    _tasks.insert(0, task);
-    await _db.saveDownload(task);
+  Future<void> pause(DownloadTask task) => _methods.invokeMethod<void>('pause', {'id': task.id});
+
+  Future<void> resume(DownloadTask task) => _methods.invokeMethod<void>('resume', {'id': task.id});
+
+  /// Retire de la liste ; [deleteFile] supprime aussi le fichier terminé.
+  /// Retourne faux si le fichier n'a pas pu être supprimé.
+  Future<bool> remove(DownloadTask task, {required bool deleteFile}) async =>
+      await _methods.invokeMethod<bool>('remove', {'id': task.id, 'deleteFile': deleteFile}) ?? false;
+
+  /// Ouvre le fichier dans l'app adaptée. Faux si aucune app ne sait l'ouvrir.
+  Future<bool> open(DownloadTask task) async =>
+      await _methods.invokeMethod<bool>('open', {'id': task.id}) ?? false;
+
+  /// Notifications (Android 13+) et stockage (Android 9-) : demandés une seule
+  /// fois, au premier téléchargement. Un refus n'empêche pas de télécharger.
+  Future<void> _askPermissionsOnce() async {
+    if (_settings.downloadPermissionsAsked) return;
+    _settings.downloadPermissionsAsked = true;
+    try {
+      await _methods.invokeMethod<Object?>('ensurePermissions');
+    } on PlatformException catch (e) {
+      debugPrint('Permissions de téléchargement : ${e.message}');
+    }
+  }
+
+  void _onEvent(dynamic event) {
+    if (event is! Map) return;
+    final Map<Object?, Object?> map = event.cast<Object?, Object?>();
+    final Object? id = map['id'];
+    if (id is! String) return;
+    if (map[_removedKey] == true) {
+      if (_tasks.remove(id) != null) notifyListeners();
+      return;
+    }
+    _upsert(DownloadTask.fromMap(map));
+  }
+
+  void _upsert(DownloadTask task) {
+    _tasks[task.id] = task;
     notifyListeners();
-    _pump();
-    return task;
-  }
-
-  void pause(DownloadTask task) {
-    if (!task.isActive) return;
-    _cancelled.add(task.id);
-    task.status = DownloadStatus.paused;
-    _persist(task);
-  }
-
-  void resume(DownloadTask task) {
-    if (task.status != DownloadStatus.paused && task.status != DownloadStatus.failed) return;
-    task
-      ..status = DownloadStatus.queued
-      ..error = null;
-    _persist(task);
-    _pump();
-  }
-
-  /// Supprime la tâche (et le fichier si [deleteFile]).
-  Future<void> remove(DownloadTask task, {bool deleteFile = true}) async {
-    _cancelled.add(task.id);
-    _tasks.remove(task);
-    await _db.deleteDownload(task.id);
-    if (deleteFile) {
-      final File file = File(task.savePath);
-      if (await file.exists()) await file.delete();
-    }
-    notifyListeners();
-  }
-
-  // ------------------------------------------------------------------ moteur
-
-  /// Démarre les tâches en attente dans la limite de [maxConcurrent].
-  void _pump() {
-    final Iterable<DownloadTask> waiting =
-        _tasks.reversed.where((t) => t.status == DownloadStatus.queued);
-    for (final DownloadTask task in waiting.toList()) {
-      if (activeCount >= maxConcurrent) break;
-      task.status = DownloadStatus.running;
-      _cancelled.remove(task.id);
-      notifyListeners();
-      unawaited(_run(task));
-    }
-  }
-
-  Future<void> _run(DownloadTask task) async {
-    try {
-      if (task.isHls) {
-        await _downloadHls(task);
-      } else {
-        await _downloadFile(task);
-      }
-      if (_cancelled.contains(task.id)) return; // mis en pause ou supprimé
-      task.status = DownloadStatus.completed;
-    } catch (e) {
-      if (_cancelled.contains(task.id)) return;
-      task
-        ..status = DownloadStatus.failed
-        ..error = e.toString();
-    } finally {
-      _cancelled.remove(task.id);
-      if (_tasks.contains(task)) await _persist(task);
-      _pump();
-    }
-  }
-
-  /// En-têtes : User-Agent, Referer et cookies du site (souvent exigés par les CDN).
-  Future<Map<String, String>> _headersFor(String url, String? referer) async {
-    final Map<String, String> headers = {
-      'User-Agent':
-          'Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) '
-              'Chrome/130.0 Mobile Safari/537.36',
-      if (referer != null) 'Referer': referer,
-    };
-    try {
-      final List<iaw.Cookie> cookies =
-          await iaw.CookieManager.instance().getCookies(url: iaw.WebUri(url));
-      if (cookies.isNotEmpty) {
-        headers['Cookie'] = cookies.map((c) => '${c.name}=${c.value}').join('; ');
-      }
-    } catch (_) {
-      // Pas de cookies disponibles : on continue sans
-    }
-    return headers;
-  }
-
-  Future<void> _downloadFile(DownloadTask task) async {
-    final File file = File(task.savePath);
-    final int existing = await file.exists() ? await file.length() : 0;
-
-    final http.Request request = http.Request('GET', Uri.parse(task.url))
-      ..headers.addAll(await _headersFor(task.url, task.referer));
-    if (existing > 0) request.headers['Range'] = 'bytes=$existing-';
-
-    final http.StreamedResponse response = await _client.send(request);
-    if (response.statusCode >= 400) {
-      throw HttpException('Erreur serveur ${response.statusCode}');
-    }
-
-    // 206 = le serveur accepte la reprise ; sinon on repart de zéro
-    final bool resumed = response.statusCode == 206 && existing > 0;
-    task.received = resumed ? existing : 0;
-    final int? length = response.contentLength;
-    task.total = length == null ? null : length + task.received;
-
-    final IOSink sink = file.openWrite(mode: resumed ? FileMode.append : FileMode.write);
-    DateTime lastUpdate = DateTime.now();
-    try {
-      await for (final List<int> chunk in response.stream) {
-        if (_cancelled.contains(task.id)) break;
-        sink.add(chunk);
-        task.received += chunk.length;
-        if (DateTime.now().difference(lastUpdate) > _progressThrottle) {
-          lastUpdate = DateTime.now();
-          notifyListeners();
-        }
-      }
-    } finally {
-      await sink.flush();
-      await sink.close();
-    }
-  }
-
-  Future<void> _downloadHls(DownloadTask task) async {
-    final Map<String, String> headers = await _headersFor(task.url, task.referer);
-
-    Uri playlistUri = Uri.parse(task.url);
-    HlsPlaylist playlist = HlsParser.parse(await _getText(playlistUri, headers), playlistUri);
-
-    // Liste maître : on prend la meilleure qualité
-    final HlsVariant? best = playlist.bestVariant;
-    if (playlist.isMaster && best != null) {
-      playlistUri = best.uri;
-      playlist = HlsParser.parse(await _getText(playlistUri, headers), playlistUri);
-    }
-    if (playlist.isEncrypted) {
-      throw const HttpException('Flux protégé (chiffré) : téléchargement impossible');
-    }
-    if (playlist.segments.isEmpty) {
-      throw const FormatException('Aucun segment dans ce flux');
-    }
-
-    task.total = playlist.segments.length;
-    final File file = File(task.savePath);
-    // Reprise : on repart du segment suivant le dernier terminé
-    final int start =
-        (await file.exists()) ? math.min(math.max(task.received, 0), playlist.segments.length) : 0;
-    task.received = start;
-    final IOSink sink = file.openWrite(mode: start > 0 ? FileMode.append : FileMode.write);
-
-    try {
-      for (int i = start; i < playlist.segments.length; i++) {
-        if (_cancelled.contains(task.id)) break;
-        final http.Response segment =
-            await _client.get(playlist.segments[i], headers: headers).timeout(const Duration(seconds: 60));
-        if (segment.statusCode >= 400) {
-          throw HttpException('Segment ${i + 1} : erreur ${segment.statusCode}');
-        }
-        sink.add(segment.bodyBytes);
-        task.received = i + 1;
-        notifyListeners();
-      }
-    } finally {
-      await sink.flush();
-      await sink.close();
-    }
-  }
-
-  Future<String> _getText(Uri uri, Map<String, String> headers) async {
-    final http.Response response =
-        await _client.get(uri, headers: headers).timeout(const Duration(seconds: 30));
-    if (response.statusCode >= 400) {
-      throw HttpException('Liste de lecture : erreur ${response.statusCode}');
-    }
-    return response.body;
-  }
-
-  Future<void> _persist(DownloadTask task) async {
-    notifyListeners();
-    await _db.saveDownload(task);
-  }
-
-  /// « video.mp4 » existe déjà → « video (1).mp4 »
-  Future<String> _uniquePath(Directory dir, String name) async {
-    final String stem = p.basenameWithoutExtension(name);
-    final String ext = p.extension(name);
-    String candidate = p.join(dir.path, name);
-    int index = 1;
-    final Set<String> reserved = _tasks.map((t) => t.savePath).toSet();
-    while (await File(candidate).exists() || reserved.contains(candidate)) {
-      candidate = p.join(dir.path, '$stem ($index)$ext');
-      index++;
-    }
-    return candidate;
   }
 
   @override
   void dispose() {
-    _client.close();
+    _subscription?.cancel();
     super.dispose();
   }
+}
+
+/// Erreur affichable à l'utilisateur.
+class DownloadException implements Exception {
+  const DownloadException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
 }
